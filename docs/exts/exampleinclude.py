@@ -29,10 +29,15 @@ from sphinx import addnodes
 from sphinx.directives.code import LiteralIncludeReader
 from sphinx.locale import _
 from sphinx.pycode import ModuleAnalyzer
-from sphinx.util import logging
-from sphinx.util import parselinenos
+from sphinx.util import logging, parselinenos
 from sphinx.util.docutils import SphinxDirective
 from sphinx.util.nodes import set_source_info
+
+try:
+    import sphinx_airflow_theme  # pylint: disable=unused-import
+    airflow_theme_is_available = True
+except ImportError:
+    airflow_theme_is_available = False
 
 logger = logging.getLogger(__name__)
 
@@ -246,5 +251,7 @@ def setup(app):
     directives.register_directive("exampleinclude", ExampleInclude)
     app.connect("doctree-read", doctree_read)
     app.add_config_value("exampleinclude_sourceroot", None, "env")
-
+    if not airflow_theme_is_available:
+        # Sphinx airflow theme has its own styles.
+        app.add_stylesheet('exampleinclude.css')
     return {"version": "builtin", "parallel_read_safe": False, "parallel_write_safe": False}

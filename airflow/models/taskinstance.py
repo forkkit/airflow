@@ -18,7 +18,6 @@
 # under the License.
 
 import copy
-import functools
 import getpass
 import hashlib
 import logging
@@ -27,29 +26,31 @@ import os
 import signal
 import time
 from datetime import timedelta
-from typing import Optional
+from typing import Iterable, Optional, Union
 from urllib.parse import quote
-import lazy_object_proxy
-import pendulum
 
 import dill
+import lazy_object_proxy
+import pendulum
 from sqlalchemy import Column, Float, Index, Integer, PickleType, String, func
 from sqlalchemy.orm import reconstructor
 from sqlalchemy.orm.session import Session
 
-from airflow.exceptions import (AirflowException, AirflowRescheduleException,
-                                AirflowSkipException, AirflowTaskTimeout)
 from airflow import settings
 from airflow.configuration import conf
-from airflow.models.base import Base, ID_LEN
+from airflow.exceptions import (
+    AirflowException, AirflowRescheduleException, AirflowSkipException, AirflowTaskTimeout,
+)
+from airflow.models.base import ID_LEN, Base
 from airflow.models.log import Log
 from airflow.models.pool import Pool
 from airflow.models.taskfail import TaskFail
 from airflow.models.taskreschedule import TaskReschedule
 from airflow.models.variable import Variable
 from airflow.models.xcom import XCOM_RETURN_KEY, XCom
+from airflow.sentry import Sentry
 from airflow.stats import Stats
-from airflow.ti_deps.dep_context import DepContext, REQUEUEABLE_DEPS, RUNNING_DEPS
+from airflow.ti_deps.dep_context import REQUEUEABLE_DEPS, RUNNING_DEPS, DepContext
 from airflow.utils import timezone
 from airflow.utils.db import provide_session
 from airflow.utils.email import send_email
@@ -91,10 +92,18 @@ def clear_task_instances(tis,
                 # Ignore errors when updating max_tries if dag is None or
                 # task not found in dag since database records could be
                 # outdated. We make max_tries the maximum value of its
-                # original max_tries or the current task try number.
-                ti.max_tries = max(ti.max_tries, ti.try_number - 1)
+                # original max_tries or the last attempted try number.
+                ti.max_tries = max(ti.max_tries, ti.prev_attempted_tries)
             ti.state = State.NONE
             session.merge(ti)
+        # Clear all reschedules related to the ti to clear
+        TR = TaskReschedule
+        session.query(TR).filter(
+            TR.dag_id == ti.dag_id,
+            TR.task_id == ti.task_id,
+            TR.execution_date == ti.execution_date,
+            TR.try_number == ti.try_number
+        ).delete()
 
     if job_ids:
         from airflow.jobs import BaseJob as BJ
@@ -205,7 +214,7 @@ class TaskInstance(Base, LoggingMixin):
         run.
 
         If the TI is currently running, this will match the column in the
-        databse, in all othercases this will be incremenetd
+        database, in all other cases this will be incremented.
         """
         # This is designed so that task logs end up in the right file.
         if self.state == State.RUNNING:
@@ -217,39 +226,22 @@ class TaskInstance(Base, LoggingMixin):
         self._try_number = value
 
     @property
+    def prev_attempted_tries(self):
+        """
+        Based on this instance's try_number, this will calculate
+        the number of previously attempted tries, defaulting to 0.
+        """
+        # Expose this for the Task Tries and Gantt graph views.
+        # Using `try_number` throws off the counts for non-running tasks.
+        # Also useful in error logging contexts to get
+        # the try number for the last try that was attempted.
+        # https://issues.apache.org/jira/browse/AIRFLOW-2143
+
+        return self._try_number
+
+    @property
     def next_try_number(self):
         return self._try_number + 1
-
-    def command(
-            self,
-            mark_success=False,
-            ignore_all_deps=False,
-            ignore_depends_on_past=False,
-            ignore_task_deps=False,
-            ignore_ti_state=False,
-            local=False,
-            pickle_id=None,
-            raw=False,
-            job_id=None,
-            pool=None,
-            cfg_path=None):
-        """
-        Returns a command that can be executed anywhere where airflow is
-        installed. This command is part of the message sent to executors by
-        the orchestrator.
-        """
-        return " ".join(self.command_as_list(
-            mark_success=mark_success,
-            ignore_all_deps=ignore_all_deps,
-            ignore_depends_on_past=ignore_depends_on_past,
-            ignore_task_deps=ignore_task_deps,
-            ignore_ti_state=ignore_ti_state,
-            local=local,
-            pickle_id=pickle_id,
-            raw=raw,
-            job_id=job_id,
-            pool=pool,
-            cfg_path=cfg_path))
 
     def command_as_list(
             self,
@@ -453,7 +445,7 @@ class TaskInstance(Base, LoggingMixin):
             self.start_date = ti.start_date
             self.end_date = ti.end_date
             # Get the raw value of try_number column, don't read through the
-            # accessor here otherwise it will be incremeneted by one already.
+            # accessor here otherwise it will be incremented by one already.
             self.try_number = ti._try_number
             self.max_tries = ti.max_tries
             self.hostname = ti.hostname
@@ -855,6 +847,7 @@ class TaskInstance(Base, LoggingMixin):
         return True
 
     @provide_session
+    @Sentry.enrich_errors
     def _run_raw_task(
             self,
             mark_success=False,
@@ -939,7 +932,10 @@ class TaskInstance(Base, LoggingMixin):
                 Stats.incr('ti_successes')
             self.refresh_from_db(lock_for_update=True)
             self.state = State.SUCCESS
-        except AirflowSkipException:
+        except AirflowSkipException as e:
+            # log only if exception has any arguments to prevent log flooding
+            if e.args:
+                self.log.info(e)
             self.refresh_from_db(lock_for_update=True)
             self.state = State.SKIPPED
         except AirflowRescheduleException as reschedule_exception:
@@ -1251,11 +1247,11 @@ class TaskInstance(Base, LoggingMixin):
         exception_html = str(exception).replace('\n', '<br>')
         jinja_context = self.get_template_context()
         # This function is called after changing the state
-        # from State.RUNNING so need to subtract 1 from self.try_number.
+        # from State.RUNNING so use prev_attempted_tries.
         jinja_context.update(dict(
             exception=exception,
             exception_html=exception_html,
-            try_number=self.try_number - 1,
+            try_number=self.prev_attempted_tries,
             max_tries=self.max_tries))
 
         jinja_env = self.task.get_template_env()
@@ -1325,10 +1321,10 @@ class TaskInstance(Base, LoggingMixin):
 
     def xcom_pull(
             self,
-            task_ids=None,
-            dag_id=None,
-            key=XCOM_RETURN_KEY,
-            include_prior_dates=False):
+            task_ids: Optional[Union[str, Iterable[str]]] = None,
+            dag_id: Optional[str] = None,
+            key: str = XCOM_RETURN_KEY,
+            include_prior_dates: bool = False):
         """
         Pull XComs that optionally meet certain criteria.
 
@@ -1362,26 +1358,34 @@ class TaskInstance(Base, LoggingMixin):
         if dag_id is None:
             dag_id = self.dag_id
 
-        pull_fn = functools.partial(
-            XCom.get_one,
+        query = XCom.get_many(
             execution_date=self.execution_date,
             key=key,
-            dag_id=dag_id,
-            include_prior_dates=include_prior_dates)
+            dag_ids=dag_id,
+            task_ids=task_ids,
+            include_prior_dates=include_prior_dates
+        ).with_entities(XCom.value)
+
+        # Since we're only fetching the values field, and not the
+        # whole class, the @recreate annotation does not kick in.
+        # Therefore we need to deserialize the fields by ourselves.
 
         if is_container(task_ids):
-            return tuple(pull_fn(task_id=t) for t in task_ids)
+            return [XCom.deserialize_value(xcom) for xcom in query]
         else:
-            return pull_fn(task_id=task_ids)
+            xcom = query.first()
+            if xcom:
+                return XCom.deserialize_value(xcom)
 
     @provide_session
     def get_num_running_task_instances(self, session):
         TI = TaskInstance
-        return session.query(TI).filter(
+        # .count() is inefficient
+        return session.query(func.count()).filter(
             TI.dag_id == self.dag_id,
             TI.task_id == self.task_id,
             TI.state == State.RUNNING
-        ).count()
+        ).scalar()
 
     def init_run_context(self, raw=False):
         """

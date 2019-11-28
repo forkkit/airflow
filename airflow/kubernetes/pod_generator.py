@@ -25,6 +25,7 @@ import copy
 import uuid
 
 import kubernetes.client.models as k8s
+
 from airflow.executors import Executors
 
 
@@ -61,6 +62,7 @@ class PodGenerator:
     Contains Kubernetes Airflow Worker configuration logic
 
     Represents a kubernetes pod and manages execution of a single pod.
+
     :param image: The docker image
     :type image: str
     :param envs: A dict containing the environment variables
@@ -86,7 +88,7 @@ class PodGenerator:
     :param configmaps: Any configmap refs to envfrom.
         If more than one configmap is required, provide a comma separated list
         configmap_a,configmap_b
-    :type configmaps: str
+    :type configmaps: List[str]
     :param dnspolicy: Specify a dnspolicy for the pod
     :type dnspolicy: str
     :param pod: The fully specified pod.
@@ -236,7 +238,6 @@ class PodGenerator:
             requests = {
                 'cpu': namespaced.get('request_cpu'),
                 'memory': namespaced.get('request_memory')
-
             }
             limits = {
                 'cpu': namespaced.get('limit_cpu'),
